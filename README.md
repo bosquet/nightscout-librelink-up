@@ -1,6 +1,6 @@
 # Nightscout LibreLink Up Uploader/Sidecar
 
-![docker-image](https://github.com/timoschlueter/nightscout-librelink-up/actions/workflows/docker-image.yml/badge.svg)
+![docker-image](https://github.com/bosquet/nightscout-librelink-up/actions/workflows/docker-image.yml/badge.svg)
 
 Script written in TypeScript that uploads CGM readings from LibreLink Up to Nightscout. The upload should
 work with at least Freestyle Libre 2 (FGM) and Libre 3 CGM sensors.
@@ -98,4 +98,4 @@ services:
 - **Integration into Nightscout**: I have not yet looked into the plugin architecture of Nightscout. Maybe this should
   be converted into a plugin.
 
-[heroku]: https://heroku.com/deploy?template=https://github.com/timoschlueter/nightscout-librelink-up
+[heroku]: https://heroku.com/deploy?template=https://github.com/bosquet/nightscout-librelink-up
