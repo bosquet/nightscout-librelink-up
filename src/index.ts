@@ -5,16 +5,44 @@
  * SPDX-License-Identifier: MIT
  */
 import {LLU_API_ENDPOINTS} from "./constants/llu-api-endpoints";
-import cron from "node-cron";
+import * as cron from "node-cron";
 import axios from "axios";
-import {createLogger, transports, format} from "winston";
+import {createLogger, format, transports} from "winston";
 import {LoginResponse} from "./interfaces/librelink/login-response";
 import {ConnectionsResponse} from "./interfaces/librelink/connections-response";
 import {GraphData, GraphResponse} from "./interfaces/librelink/graph-response";
 import {AuthTicket, Connection, GlucoseItem} from "./interfaces/librelink/common";
 import {getUtcDateFromString, mapTrendArrow} from "./helpers/helpers";
-import {LibreLinkUpHttpHeaders, NightScoutHttpHeaders} from "./interfaces/http-headers";
-import {Entry} from "./interfaces/nightscout/entry";
+import {LibreLinkUpHttpHeaders} from "./interfaces/http-headers";
+import {Client as ClientV1} from "./nightscout/apiv1";
+import {Client as ClientV3} from "./nightscout/apiv3";
+import {Entry} from "./nightscout/interface";
+import readConfig from "./config";
+import {CookieJar} from "tough-cookie";
+import {HttpCookieAgent} from "http-cookie-agent/http";
+import {Agent as HttpAgent} from "node:http";
+import {Agent as HttpsAgent} from "node:https";
+import * as crypto from "crypto";
+
+// Generate new Ciphers for stealth mode in order to bypass SSL fingerprinting used by Cloudflare.
+// The new Ciphers are then used in the HTTPS Agent for Axios.
+const defaultCiphers: Array<string> = crypto.constants.defaultCipherList.split(":");
+const stealthCiphers: Array<string> = [
+    defaultCiphers[0],
+    defaultCiphers[2],
+    defaultCiphers[1],
+    ...defaultCiphers.slice(3)
+];
+
+const stealthHttpsAgent: HttpsAgent = new HttpsAgent({
+    ciphers: stealthCiphers.join(":")
+});
+
+// Create a new CookieJar and HttpCookieAgent for Axios to handle cookies.
+const jar: CookieJar = new CookieJar();
+const cookieAgent: HttpAgent = new HttpCookieAgent({cookies: {jar}})
+
+let config = readConfig();
 
 const {combine, timestamp, printf} = format;
 
@@ -29,67 +57,34 @@ const logger = createLogger({
         logFormat
     ),
     transports: [
-        new transports.Console({level: process.env.LOG_LEVEL || "info"}),
+        new transports.Console({level: config.logLevel}),
     ]
 });
 
-axios.interceptors.response.use(response =>
-{
-    return response;
-}, error =>
-{
-    if (error.response)
+axios.interceptors.response.use(
+    response => response,
+    error =>
     {
-        logger.error(JSON.stringify(error.response.data));
+        if (error.response)
+        {
+            logger.error(JSON.stringify(error.response.data));
+        }
+        else
+        {
+            logger.error(error.message);
+        }
+        return error;
     }
-    else
-    {
-        logger.error(error.message);
-    }
-    return error;
-});
+);
 
-const USER_AGENT = "FreeStyle LibreLink Up NightScout Uploader";
-
-/**
- * LibreLink Up Credentials
- */
-const LINK_UP_USERNAME = process.env.LINK_UP_USERNAME;
-const LINK_UP_PASSWORD = process.env.LINK_UP_PASSWORD;
+const USER_AGENT = "Mozilla/5.0 (iPhone; CPU OS 17_4.1 like Mac OS X) AppleWebKit/536.26 (KHTML, like Gecko) Version/17.4.1 Mobile/10A5355d Safari/8536.25";
 
 /**
  * LibreLink Up API Settings (Don't change this unless you know what you are doing)
  */
-const LIBRE_LINK_UP_VERSION = "4.7.0";
+const LIBRE_LINK_UP_VERSION = "4.10.0";
 const LIBRE_LINK_UP_PRODUCT = "llu.ios";
-const LINK_UP_REGION = process.env.LINK_UP_REGION || "EU";
-const LIBRE_LINK_UP_URL = getLibreLinkUpUrl(LINK_UP_REGION);
-
-function getLibreLinkUpUrl(region: string): string
-{
-    if (LLU_API_ENDPOINTS.hasOwnProperty(region))
-    {
-        return LLU_API_ENDPOINTS[region];
-    }
-    return LLU_API_ENDPOINTS.EU;
-}
-
-/**
- * NightScout API
- */
-const NIGHTSCOUT_URL = process.env.NIGHTSCOUT_URL;
-const NIGHTSCOUT_API_TOKEN = process.env.NIGHTSCOUT_API_TOKEN;
-const NIGHTSCOUT_DISABLE_HTTPS = process.env.NIGHTSCOUT_DISABLE_HTTPS || false;
-const NIGHTSCOUT_DEVICE_NAME = process.env.DEVICE_NAME || "nightscout-librelink-up";
-
-function getNightscoutUrl(): string
-{
-    if (NIGHTSCOUT_DISABLE_HTTPS === "true")
-    {
-        return "http://" + NIGHTSCOUT_URL;
-    }
-    return "https://" + NIGHTSCOUT_URL;
-}
+const LIBRE_LINK_UP_URL = LLU_API_ENDPOINTS[config.linkUpRegion];
 
 /**
  * last known authTicket
@@ -98,29 +93,18 @@ let authTicket: AuthTicket = {duration: 0, expires: 0, token: ""};
 
 const libreLinkUpHttpHeaders: LibreLinkUpHttpHeaders = {
     "User-Agent": USER_AGENT,
-    "Content-Type": "application/json",
+    "Content-Type": "application/json;charset=UTF-8",
     "version": LIBRE_LINK_UP_VERSION,
-    "product": LIBRE_LINK_UP_PRODUCT,
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Pragma": "no-cache",
-    "Cache-Control": "no-cache",
-    "Authorization": undefined
+    "product": LIBRE_LINK_UP_PRODUCT
 }
 
-const nightScoutHttpHeaders: NightScoutHttpHeaders = {
-    "api-secret": NIGHTSCOUT_API_TOKEN,
-    "User-Agent": USER_AGENT,
-    "Content-Type": "application/json",
-}
-
-if (process.env.SINGLE_SHOT === "true")
+if (config.singleShot)
 {
     main().then();
 }
 else
 {
-    const schedule = "*/" + (process.env.LINK_UP_TIME_INTERVAL || 5) + " * * * *";
+    const schedule = `*/${config.linkUpTimeInterval} * * * *`;
     logger.info("Starting cron schedule: " + schedule)
     cron.schedule(schedule, () =>
     {
@@ -156,26 +140,33 @@ async function main(): Promise<void>
 
 export async function login(): Promise<AuthTicket | null>
 {
+    config = readConfig()
+    
     try
     {
         const url = "https://" + LIBRE_LINK_UP_URL + "/llu/auth/login"
-        const response: {data: LoginResponse} = await axios.post(
+        const response: { data: LoginResponse } = await axios.post(
             url,
             {
-                email: LINK_UP_USERNAME,
-                password: LINK_UP_PASSWORD,
+                email: config.linkUpUsername,
+                password: config.linkUpPassword,
             },
             {
-                headers: libreLinkUpHttpHeaders
+                headers: libreLinkUpHttpHeaders,
+                withCredentials: true, // Enable automatic cookie handling
+                httpAgent: cookieAgent,
+                httpsAgent: stealthHttpsAgent
             });
 
         try
         {
-            if (response.data.status !== 0) {
+            if (response.data.status !== 0)
+            {
                 logger.error(`LibreLink Up - Non-zero status code: ${JSON.stringify(response.data)}`)
                 return null;
             }
-            if (response.data.data.redirect === true && response.data.data.region) {
+            if (response.data.data.redirect === true && response.data.data.region)
+            {
                 const correctRegion = response.data.data.region.toUpperCase();
                 logger.error(
                     `LibreLink Up - Logged in to the wrong region. Switch to '${correctRegion}' region.`
@@ -198,6 +189,8 @@ export async function login(): Promise<AuthTicket | null>
 
 export async function getGlucoseMeasurements(): Promise<GraphData | null>
 {
+    config = readConfig()
+
     try
     {
         const connectionId = await getLibreLinkUpConnection();
@@ -207,10 +200,13 @@ export async function getGlucoseMeasurements(): Promise<GraphData | null>
         }
 
         const url = "https://" + LIBRE_LINK_UP_URL + "/llu/connections/" + connectionId + "/graph"
-        const response: {data: GraphResponse} = await axios.get(
+        const response: { data: GraphResponse } = await axios.get(
             url,
             {
-                headers: getLluAuthHeaders()
+                headers: getLluAuthHeaders(),
+                withCredentials: true, // Enable automatic cookie handling
+                httpAgent: cookieAgent,
+                httpsAgent: stealthHttpsAgent,
             });
 
         return response.data.data;
@@ -224,13 +220,18 @@ export async function getGlucoseMeasurements(): Promise<GraphData | null>
 
 export async function getLibreLinkUpConnection(): Promise<string | null>
 {
+    config = readConfig()
+
     try
     {
         const url = "https://" + LIBRE_LINK_UP_URL + "/llu/connections"
-        const response: {data: ConnectionsResponse} = await axios.get(
+        const response: { data: ConnectionsResponse } = await axios.get(
             url,
             {
-                headers: getLluAuthHeaders()
+                headers: getLluAuthHeaders(),
+                withCredentials: true, // Enable automatic cookie handling
+                httpAgent: cookieAgent,
+                httpsAgent: stealthHttpsAgent,
             });
 
         const connectionData = response.data.data;
@@ -250,14 +251,15 @@ export async function getLibreLinkUpConnection(): Promise<string | null>
 
         dumpConnectionData(connectionData);
 
-        if (!process.env.LINK_UP_CONNECTION)
+        if (!config.linkUpConnection)
         {
             logger.warn("You did not specify a Patient-ID in the LINK_UP_CONNECTION environment variable.");
             logPickedUpConnection(connectionData[0]);
             return connectionData[0].patientId;
         }
 
-        const connection = connectionData.filter(connectionEntry => connectionEntry.patientId === process.env.LINK_UP_CONNECTION)[0];
+        const connection = connectionData.filter(connectionEntry => connectionEntry.patientId === config.linkUpConnection)[0];
+
         if (!connection)
         {
             logger.error("The specified Patient-ID was not found.");
@@ -274,53 +276,34 @@ export async function getLibreLinkUpConnection(): Promise<string | null>
     }
 }
 
-async function lastEntryDate(): Promise<Date | null>
-{
-    const url = getNightscoutUrl() + "/api/v1/entries?count=1"
-    const response = await axios.get(
-        url,
-        {
-            headers: nightScoutHttpHeaders
-        });
-
-    if (!response.data || response.data.length === 0)
-    {
-        return null;
-    }
-    return new Date(response.data.pop().dateString);
-}
+const nightscoutClient = config.nightscoutApiV3
+    ? new ClientV3(config)
+    : new ClientV1(config);
 
 export async function createFormattedMeasurements(measurementData: GraphData): Promise<Entry[]>
 {
     const formattedMeasurements: Entry[] = [];
     const glucoseMeasurement = measurementData.connection.glucoseMeasurement;
     const measurementDate = getUtcDateFromString(glucoseMeasurement.FactoryTimestamp);
-    const lastEntry = await lastEntryDate();
-
+    const lastEntry = config.allData ? null : await nightscoutClient.lastEntry();
     // Add the most recent measurement first
-    if (lastEntry === null || measurementDate > lastEntry)
+    if (lastEntry === null || measurementDate > lastEntry.date)
     {
         formattedMeasurements.push({
-            "type": "sgv",
-            "device": NIGHTSCOUT_DEVICE_NAME,
-            "dateString": measurementDate.toISOString(),
-            "date": measurementDate.getTime(),
-            "direction": mapTrendArrow(glucoseMeasurement.TrendArrow),
-            "sgv": glucoseMeasurement.ValueInMgPerDl
+            date: measurementDate,
+            direction: mapTrendArrow(glucoseMeasurement.TrendArrow),
+            sgv: glucoseMeasurement.ValueInMgPerDl
         });
     }
 
     measurementData.graphData.forEach((glucoseMeasurementHistoryEntry: GlucoseItem) =>
     {
         const entryDate = getUtcDateFromString(glucoseMeasurementHistoryEntry.FactoryTimestamp);
-        if (lastEntry === null ||entryDate > lastEntry)
+        if (lastEntry === null || entryDate > lastEntry.date)
         {
             formattedMeasurements.push({
-                "type": "sgv",
-                "device": NIGHTSCOUT_DEVICE_NAME,
-                "dateString": entryDate.toISOString(),
-                "date": entryDate.getTime(),
-                "sgv": glucoseMeasurementHistoryEntry.ValueInMgPerDl
+                date: entryDate,
+                sgv: glucoseMeasurementHistoryEntry.ValueInMgPerDl,
             });
         }
     });
@@ -336,21 +319,8 @@ async function uploadToNightScout(measurementData: GraphData): Promise<void>
         logger.info("Trying to upload " + formattedMeasurements.length + " glucose measurement items to Nightscout");
         try
         {
-            const url = getNightscoutUrl() + "/api/v1/entries"
-            const response = await axios.post(
-                url,
-                formattedMeasurements,
-                {
-                    headers: nightScoutHttpHeaders
-                });
-            if (response.status !== 200)
-            {
-                logger.error("Upload to NightScout failed ", response.statusText);
-            }
-            else
-            {
-                logger.info("Upload of " + formattedMeasurements.length + " measurements to Nightscout succeeded");
-            }
+            await nightscoutClient.uploadEntries(formattedMeasurements);
+            logger.info("Upload of " + formattedMeasurements.length + " measurements to Nightscout succeeded");
         } catch (error)
         {
             logger.error("Upload to NightScout failed ", error);
@@ -378,7 +348,6 @@ function logPickedUpConnection(connection: Connection): void
         "-> The following connection will be used: " + connection.firstName + " " + connection.lastName + " (Patient-ID: " +
         connection.patientId + ")");
 }
-
 
 function getLluAuthHeaders(): LibreLinkUpHttpHeaders
 {
